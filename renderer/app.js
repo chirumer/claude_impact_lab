@@ -2,6 +2,7 @@ const state = {
   personas: [],
   activePersonaId: null,
   hasApiKey: true,
+  activeContact: null, // { id, name, initials, color, isPeer }
   messages: [],
   feedbackByQaId: {},
   replyTarget: null, // { messageId, quote }
@@ -15,6 +16,8 @@ const els = {
   personaSwitcher: document.getElementById('persona-switcher'),
   contactList: document.getElementById('contact-list'),
   backBtn: document.getElementById('back-btn'),
+  threadAvatar: document.getElementById('thread-avatar'),
+  threadName: document.getElementById('thread-name'),
   messages: document.getElementById('messages'),
   composer: document.getElementById('composer'),
   composerInput: document.getElementById('composer-input'),
@@ -36,10 +39,6 @@ function updateClock() {
 updateClock();
 setInterval(updateClock, 15000);
 
-function activePersona() {
-  return state.personas.find((p) => p.id === state.activePersonaId) || null;
-}
-
 function truncate(text, n) {
   if (!text) return '';
   return text.length > n ? text.slice(0, n - 1) + '…' : text;
@@ -48,6 +47,18 @@ function truncate(text, n) {
 function timeLabel(iso) {
   const d = new Date(iso);
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function personaName(personaId) {
+  if (personaId === 'assistant') return 'RestoLine';
+  const p = state.personas.find((x) => x.id === personaId);
+  return p ? p.name : personaId;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
 }
 
 // ---- Screens ----
@@ -80,42 +91,42 @@ function renderPersonaSwitcher() {
   }
 }
 
-// ---- Contact list (single RestoLine contact) ----
+// ---- Contact list ----
 async function renderContactList() {
   els.contactList.innerHTML = '';
-  const { messages } = await window.restoline.getThread(state.activePersonaId);
-  const last = messages[messages.length - 1];
+  const contacts = await window.restoline.getContacts(state.activePersonaId);
 
-  const row = document.createElement('div');
-  row.className = 'contact-row';
-  row.innerHTML = `
-    <div class="avatar">R</div>
-    <div class="contact-meta">
-      <div class="contact-name-row">
-        <span class="contact-name">RestoLine</span>
-        <span class="contact-time">${last ? timeLabel(last.createdAt) : ''}</span>
+  for (const contact of contacts) {
+    const row = document.createElement('div');
+    row.className = 'contact-row';
+    const avatarStyle = contact.color ? ` style="background: ${contact.color}"` : '';
+    row.innerHTML = `
+      <div class="avatar"${avatarStyle}>${escapeHtml(contact.initials)}</div>
+      <div class="contact-meta">
+        <div class="contact-name-row">
+          <span class="contact-name">${escapeHtml(contact.name)}</span>
+          <span class="contact-time">${contact.lastMessageAt ? timeLabel(contact.lastMessageAt) : ''}</span>
+        </div>
+        <div class="contact-preview">${contact.lastMessage ? escapeHtml(truncate(contact.lastMessage, 42)) : 'No messages yet'}</div>
       </div>
-      <div class="contact-preview">${last ? escapeHtml(truncate(last.text, 42)) : 'No messages yet'}</div>
-    </div>
-  `;
-  row.addEventListener('click', openThread);
-  els.contactList.appendChild(row);
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+    `;
+    row.addEventListener('click', () => openThread(contact));
+    els.contactList.appendChild(row);
+  }
 }
 
 // ---- Thread ----
-async function openThread() {
+async function openThread(contact) {
+  state.activeContact = contact;
+  els.threadAvatar.textContent = contact.initials;
+  els.threadAvatar.style.background = contact.color || '';
+  els.threadName.textContent = contact.name;
   showThread();
   await loadThread();
 }
 
 async function loadThread() {
-  const { messages, feedbackByQaId } = await window.restoline.getThread(state.activePersonaId);
+  const { messages, feedbackByQaId } = await window.restoline.getThread(state.activePersonaId, state.activeContact.id);
   state.messages = messages;
   state.feedbackByQaId = feedbackByQaId;
   renderMessages();
@@ -138,10 +149,23 @@ function sentimentEmoji(sentiment) {
 
 function renderMessages() {
   els.messages.innerHTML = '';
+  const isPeerThread = state.activeContact.isPeer;
 
   for (const msg of state.messages) {
+    // In the RestoLine thread, sender is literally 'user'/'assistant'. In a
+    // peer thread, sender is whichever persona typed it — compare against
+    // the persona currently "driving" the app to pick a side of the thread.
+    const mine = msg.sender === 'user' || msg.sender === state.activePersonaId;
+
     const row = document.createElement('div');
-    row.className = `bubble-row ${msg.sender}`;
+    row.className = `bubble-row ${mine ? 'user' : 'assistant'}`;
+
+    if (isPeerThread && !mine) {
+      const label = document.createElement('div');
+      label.className = 'bubble-sender-label';
+      label.textContent = personaName(msg.sender);
+      row.appendChild(label);
+    }
 
     if (msg.replyToId) {
       const original = findMessageById(msg.replyToId);
@@ -157,11 +181,11 @@ function renderMessages() {
     wrap.className = 'bubble-wrap';
 
     const bubble = document.createElement('div');
-    bubble.className = 'bubble' + (msg.isFollowupPrompt ? ' followup' : '');
+    bubble.className = 'bubble' + (msg.isFollowupPrompt || msg.isPeerOffer ? ' followup' : '');
     bubble.textContent = msg.text;
     wrap.appendChild(bubble);
 
-    const canReply = msg.sender === 'assistant' && !msg.isFollowupPrompt;
+    const canReply = !isPeerThread && msg.sender === 'assistant' && !msg.isFollowupPrompt && !msg.isPeerOffer;
     const existingFeedback = canReply ? feedbackForMessage(msg.qaId, msg.id) : null;
 
     if (canReply && !existingFeedback) {
@@ -175,7 +199,7 @@ function renderMessages() {
 
     row.appendChild(wrap);
 
-    if (msg.sender === 'assistant') {
+    if (!isPeerThread && msg.sender === 'assistant') {
       const captionParts = [];
       if (msg.usedWebSearch) captionParts.push('🔎 Searched the web for up-to-date info');
       if (msg.matchedContextCount) {
@@ -183,6 +207,7 @@ function renderMessages() {
           `Informed by ${msg.matchedContextCount} similar past question${msg.matchedContextCount > 1 ? 's' : ''}`
         );
       }
+      if (msg.isPeerOffer) captionParts.push('💡 Peer connection offer');
       if (captionParts.length) {
         const caption = document.createElement('div');
         caption.className = 'bubble-caption';
@@ -268,7 +293,7 @@ els.composer.addEventListener('submit', async (e) => {
       result = await window.restoline.sendFeedback(state.activePersonaId, replyTarget.messageId, text);
     } else {
       showTyping();
-      result = await window.restoline.sendMessage(state.activePersonaId, text);
+      result = await window.restoline.sendMessage(state.activePersonaId, state.activeContact.id, text);
     }
     hideTyping();
 

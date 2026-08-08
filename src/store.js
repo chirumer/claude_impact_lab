@@ -6,6 +6,8 @@ const path = require('path');
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'app.json');
 
+const RESTOLINE_CONTACT_ID = 'restoline';
+
 const SEED_PERSONAS = [
   { id: 'you', name: 'You', initials: 'Y', color: '#0a84ff' },
   { id: 'alex', name: 'Alex', initials: 'A', color: '#ff9f0a' },
@@ -58,21 +60,25 @@ function seedHistory(data) {
     data.messages.push({
       id: qId,
       personaId: entry.personaId,
+      contactId: RESTOLINE_CONTACT_ID,
       sender: 'user',
       text: entry.question,
       replyToId: null,
       qaId,
       isFollowupPrompt: false,
+      isPeerOffer: false,
       createdAt,
     });
     data.messages.push({
       id: aId,
       personaId: entry.personaId,
+      contactId: RESTOLINE_CONTACT_ID,
       sender: 'assistant',
       text: entry.answer,
       replyToId: null,
       qaId,
       isFollowupPrompt: false,
+      isPeerOffer: false,
       usedWebSearch: false,
       createdAt: minutesAgo(entry.minsAgo - 1),
     });
@@ -88,6 +94,7 @@ function seedHistory(data) {
       usedWebSearch: false,
       requiresTool: 'none',
       pendingFollowup: false,
+      peerOffer: null,
       createdAt,
     });
 
@@ -117,6 +124,7 @@ function defaultData() {
     messages: [],
     qaRecords: [],
     feedback: [],
+    connections: [],
   };
   seedHistory(data);
   return data;
@@ -134,6 +142,7 @@ function load() {
   }
   try {
     cache = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!cache.connections) cache.connections = [];
   } catch (err) {
     console.error('Failed to read data file, reseeding.', err);
     cache = defaultData();
@@ -151,6 +160,10 @@ function getPersonas() {
   return load().personas;
 }
 
+function getPersona(id) {
+  return load().personas.find((p) => p.id === id) || null;
+}
+
 function getActivePersonaId() {
   return load().activePersonaId;
 }
@@ -161,25 +174,62 @@ function setActivePersonaId(id) {
   persist();
 }
 
+// ---- Contacts ----
+// The RestoLine bot contact, plus one contact per accepted peer connection.
+function getContactsForPersona(personaId) {
+  const restoline = { id: RESTOLINE_CONTACT_ID, name: 'RestoLine', initials: 'R', color: null, isPeer: false };
+  const peers = getConnectionsForPersona(personaId).map((c) => {
+    const otherId = c.personaAId === personaId ? c.personaBId : c.personaAId;
+    const other = getPersona(otherId);
+    return {
+      id: c.id,
+      name: other ? other.name : 'Unknown',
+      initials: other ? other.initials : '?',
+      color: other ? other.color : '#8e8e93',
+      isPeer: true,
+    };
+  });
+  return [restoline, ...peers];
+}
+
 // ---- Messages ----
-function getMessages(personaId) {
-  return load().messages.filter((m) => m.personaId === personaId);
+// RestoLine threads are private per persona; connection threads are shared
+// between the two connected personas (same contactId, no personaId filter).
+function getThreadMessages(personaId, contactId) {
+  const messages = load().messages;
+  if (contactId === RESTOLINE_CONTACT_ID) {
+    return messages.filter((m) => m.personaId === personaId && (m.contactId || RESTOLINE_CONTACT_ID) === RESTOLINE_CONTACT_ID);
+  }
+  return messages.filter((m) => m.contactId === contactId);
 }
 
 function getMessageById(id) {
   return load().messages.find((m) => m.id === id) || null;
 }
 
-function addMessage({ personaId, sender, text, replyToId = null, qaId = null, isFollowupPrompt = false, usedWebSearch = false, matchedContextCount = 0 }) {
+function addMessage({
+  personaId,
+  contactId = RESTOLINE_CONTACT_ID,
+  sender,
+  text,
+  replyToId = null,
+  qaId = null,
+  isFollowupPrompt = false,
+  isPeerOffer = false,
+  usedWebSearch = false,
+  matchedContextCount = 0,
+}) {
   const data = load();
   const message = {
     id: genId('msg'),
     personaId,
+    contactId,
     sender,
     text,
     replyToId,
     qaId,
     isFollowupPrompt,
+    isPeerOffer,
     usedWebSearch,
     matchedContextCount,
     createdAt: new Date().toISOString(),
@@ -203,6 +253,7 @@ function createQaRecord({ personaId, questionMessageId, answerMessageId, questio
     usedWebSearch,
     requiresTool: 'none',
     pendingFollowup: false,
+    peerOffer: null,
     createdAt: new Date().toISOString(),
   };
   data.qaRecords.push(record);
@@ -212,6 +263,10 @@ function createQaRecord({ personaId, questionMessageId, answerMessageId, questio
 
 function getQaRecord(id) {
   return load().qaRecords.find((q) => q.id === id) || null;
+}
+
+function getAllQaRecords() {
+  return load().qaRecords;
 }
 
 function updateQaRecord(id, patch) {
@@ -231,8 +286,59 @@ function getQaRecordsWithFeedback() {
   return data.qaRecords.filter((q) => qaIdsWithFeedback.has(q.id) && q.questionEmbedding);
 }
 
+// All embedded questions from OTHER personas — the pool for "someone else is
+// going through the same thing" peer matching (feedback not required here).
+function getQaRecordsFromOtherPersonas(personaId) {
+  return load().qaRecords.filter((q) => q.personaId !== personaId && q.questionEmbedding);
+}
+
 function getAllQaRecordsMissingEmbedding() {
   return load().qaRecords.filter((q) => !q.questionEmbedding);
+}
+
+// Has this persona already been offered a connection to this specific peer
+// persona before (regardless of outcome)? Prevents repeat offers every turn.
+function hasPeerOfferBeenMadeFor(personaId, peerPersonaId) {
+  return load().qaRecords.some(
+    (q) => q.personaId === personaId && q.peerOffer && q.peerOffer.personaId === peerPersonaId
+  );
+}
+
+function findPendingPeerOfferQa(personaId) {
+  return (
+    load()
+      .qaRecords.filter((q) => q.personaId === personaId && q.peerOffer && q.peerOffer.status === 'pending')
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null
+  );
+}
+
+// ---- Connections (peer-to-peer threads between two personas) ----
+function getConnectionsForPersona(personaId) {
+  return load().connections.filter((c) => c.personaAId === personaId || c.personaBId === personaId);
+}
+
+function getConnectionBetween(personaAId, personaBId) {
+  return (
+    load().connections.find(
+      (c) =>
+        (c.personaAId === personaAId && c.personaBId === personaBId) ||
+        (c.personaAId === personaBId && c.personaBId === personaAId)
+    ) || null
+  );
+}
+
+function getConnection(id) {
+  return load().connections.find((c) => c.id === id) || null;
+}
+
+function createConnection({ personaAId, personaBId }) {
+  const existing = getConnectionBetween(personaAId, personaBId);
+  if (existing) return existing;
+  const data = load();
+  const connection = { id: genId('conn'), personaAId, personaBId, createdAt: new Date().toISOString() };
+  data.connections.push(connection);
+  persist();
+  return connection;
 }
 
 // ---- Feedback ----
@@ -284,19 +390,30 @@ function markFeedbackAnalyzed(id, analysis) {
 }
 
 module.exports = {
+  RESTOLINE_CONTACT_ID,
   load,
   persist,
   getPersonas,
+  getPersona,
   getActivePersonaId,
   setActivePersonaId,
-  getMessages,
+  getContactsForPersona,
+  getThreadMessages,
   getMessageById,
   addMessage,
   createQaRecord,
   getQaRecord,
+  getAllQaRecords,
   updateQaRecord,
   getQaRecordsWithFeedback,
+  getQaRecordsFromOtherPersonas,
   getAllQaRecordsMissingEmbedding,
+  hasPeerOfferBeenMadeFor,
+  findPendingPeerOfferQa,
+  getConnectionsForPersona,
+  getConnectionBetween,
+  getConnection,
+  createConnection,
   addFeedback,
   getFeedbackForQa,
   getUnanalyzedFeedback,

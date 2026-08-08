@@ -1,6 +1,6 @@
 const store = require('./store');
 const ai = require('./ai');
-const { findSimilarFeedbackQuestions, buildContextBlock } = require('./similarity');
+const { findSimilarFeedbackQuestions, buildContextBlock, findPeerMatch } = require('./similarity');
 
 // Embeddings are a nice-to-have (cross-user context), not required to answer.
 // If Voyage is unconfigured or erroring, log it once and fall through to
@@ -50,13 +50,30 @@ async function seedIfNeeded() {
 
 function findPendingFollowupQa(personaId) {
   const data = store.load();
-  return data.qaRecords
-    .filter((q) => q.personaId === personaId && q.pendingFollowup)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
+  return (
+    data.qaRecords
+      .filter((q) => q.personaId === personaId && q.pendingFollowup)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null
+  );
 }
 
-async function sendMessage(personaId, text) {
-  const userMsg = store.addMessage({ personaId, sender: 'user', text });
+// Routes an incoming message to the right thread: the RestoLine bot, or a
+// peer-to-peer connection thread with another persona.
+async function sendMessage(personaId, contactId, text) {
+  if (contactId === store.RESTOLINE_CONTACT_ID) {
+    return sendRestolineMessage(personaId, text);
+  }
+  return sendConnectionMessage(personaId, contactId, text);
+}
+
+async function sendRestolineMessage(personaId, text) {
+  const userMsg = store.addMessage({ personaId, contactId: store.RESTOLINE_CONTACT_ID, sender: 'user', text });
+
+  const peerOfferQa = store.findPendingPeerOfferQa(personaId);
+  if (peerOfferQa) {
+    await respondToPeerOffer(personaId, peerOfferQa, text);
+    return { ok: true };
+  }
 
   const pendingQa = findPendingFollowupQa(personaId);
   if (pendingQa) {
@@ -86,6 +103,7 @@ async function askNewQuestion(personaId, userMsg, text) {
 
   const assistantMsg = store.addMessage({
     personaId,
+    contactId: store.RESTOLINE_CONTACT_ID,
     sender: 'assistant',
     text: answer,
     qaId: qa.id,
@@ -93,6 +111,74 @@ async function askNewQuestion(personaId, userMsg, text) {
     matchedContextCount: matches.length,
   });
   store.updateQaRecord(qa.id, { answerMessageId: assistantMsg.id });
+
+  if (embedding) await maybeOfferPeerConnection(personaId, qa, embedding);
+}
+
+// If someone else asked essentially the same question, offer to connect the
+// two people directly — they're going through the same thing.
+async function maybeOfferPeerConnection(personaId, qa, embedding) {
+  const alreadyConnectedTo = new Set(
+    store.getConnectionsForPersona(personaId).map((c) => (c.personaAId === personaId ? c.personaBId : c.personaAId))
+  );
+  const alreadyOfferedTo = store
+    .getAllQaRecords()
+    .filter((q) => q.personaId === personaId && q.peerOffer)
+    .map((q) => q.peerOffer.personaId);
+  const exclude = new Set([...alreadyConnectedTo, ...alreadyOfferedTo]);
+
+  const match = findPeerMatch(embedding, personaId, { excludePersonaIds: [...exclude] });
+  if (!match) return;
+
+  const peer = store.getPersona(match.qa.personaId);
+  if (!peer) return;
+
+  store.updateQaRecord(qa.id, {
+    peerOffer: { personaId: peer.id, personaName: peer.name, theirQaId: match.qa.id, status: 'pending' },
+  });
+
+  store.addMessage({
+    personaId,
+    contactId: store.RESTOLINE_CONTACT_ID,
+    sender: 'assistant',
+    text: `By the way — ${peer.name} asked something really similar recently. Want me to connect you two so you can talk directly?`,
+    qaId: qa.id,
+    isPeerOffer: true,
+  });
+}
+
+async function respondToPeerOffer(personaId, qa, replyText) {
+  const offer = qa.peerOffer;
+  const accepted = await ai.interpretYesNo(replyText);
+
+  if (accepted) {
+    const connection = store.createConnection({ personaAId: personaId, personaBId: offer.personaId });
+    store.updateQaRecord(qa.id, { peerOffer: { ...offer, status: 'accepted' } });
+
+    store.addMessage({
+      personaId,
+      contactId: store.RESTOLINE_CONTACT_ID,
+      sender: 'assistant',
+      text: `Connected! You'll now see ${offer.personaName} in your contacts — say hi.`,
+      qaId: qa.id,
+    });
+
+    store.addMessage({
+      personaId,
+      contactId: connection.id,
+      sender: 'assistant',
+      text: `RestoLine connected you two because you were both dealing with something similar. Say hi!`,
+    });
+  } else {
+    store.updateQaRecord(qa.id, { peerOffer: { ...offer, status: 'declined' } });
+    store.addMessage({
+      personaId,
+      contactId: store.RESTOLINE_CONTACT_ID,
+      sender: 'assistant',
+      text: 'No worries — let me know if you change your mind.',
+      qaId: qa.id,
+    });
+  }
 }
 
 async function continueWithFollowupAnswer(personaId, qa, followupAnswerText) {
@@ -118,12 +204,25 @@ async function continueWithFollowupAnswer(personaId, qa, followupAnswerText) {
 
   store.addMessage({
     personaId,
+    contactId: store.RESTOLINE_CONTACT_ID,
     sender: 'assistant',
     text: refinedAnswer,
     qaId: qa.id,
     usedWebSearch: useWebSearch,
   });
   store.updateQaRecord(qa.id, { answerText: refinedAnswer, pendingFollowup: false });
+}
+
+// Peer-to-peer messages are a plain relay between the two connected personas —
+// no AI involved. The "other side" of the conversation is whoever the user
+// switches personas to.
+async function sendConnectionMessage(personaId, connectionId, text) {
+  const connection = store.getConnection(connectionId);
+  if (!connection || (connection.personaAId !== personaId && connection.personaBId !== personaId)) {
+    return { ok: false, error: 'Connection not found.' };
+  }
+  store.addMessage({ personaId, contactId: connectionId, sender: personaId, text });
+  return { ok: true };
 }
 
 async function sendFeedback(personaId, messageId, feedbackText) {
@@ -134,7 +233,14 @@ async function sendFeedback(personaId, messageId, feedbackText) {
   const qa = store.getQaRecord(message.qaId);
   if (!qa) return { ok: false, error: 'Original question not found.' };
 
-  store.addMessage({ personaId, sender: 'user', text: feedbackText, replyToId: messageId, qaId: qa.id });
+  store.addMessage({
+    personaId,
+    contactId: store.RESTOLINE_CONTACT_ID,
+    sender: 'user',
+    text: feedbackText,
+    replyToId: messageId,
+    qaId: qa.id,
+  });
 
   const analysis = await ai.analyzeFeedback({
     question: qa.questionText,
@@ -151,6 +257,7 @@ async function sendFeedback(personaId, messageId, feedbackText) {
     store.updateQaRecord(qa.id, { pendingFollowup: true });
     store.addMessage({
       personaId,
+      contactId: store.RESTOLINE_CONTACT_ID,
       sender: 'assistant',
       text: analysis.followupQuestion,
       qaId: qa.id,

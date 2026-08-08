@@ -2,6 +2,10 @@ const store = require('./store');
 
 const DEFAULT_THRESHOLD = Number(process.env.SIMILARITY_THRESHOLD) || 0.75;
 const MAX_MATCHES = 3;
+// Peer-connection matches need to be a much closer topical match than the
+// "informs my answer" context threshold above — this is "the same problem,"
+// not just "a related question."
+const PEER_THRESHOLD = Number(process.env.PEER_SIMILARITY_THRESHOLD) || 0.85;
 
 function cosineSimilarity(a, b) {
   let dot = 0;
@@ -56,4 +60,30 @@ function buildContextBlock(matches) {
   return { contextBlock, useWebSearch };
 }
 
-module.exports = { cosineSimilarity, findSimilarFeedbackQuestions, buildContextBlock, DEFAULT_THRESHOLD };
+// Finds the single best match from OTHER personas asking essentially the same
+// question, so RestoLine can offer to connect the two people. `excludePersonaIds`
+// filters out peers who've already been offered a connection to this persona.
+function findPeerMatch(questionEmbedding, currentPersonaId, { excludePersonaIds = [] } = {}) {
+  const excluded = new Set(excludePersonaIds);
+  const candidates = store
+    .getQaRecordsFromOtherPersonas(currentPersonaId)
+    .filter((qa) => !excluded.has(qa.personaId));
+
+  let best = null;
+  for (const qa of candidates) {
+    const score = cosineSimilarity(questionEmbedding, qa.questionEmbedding);
+    if (score >= PEER_THRESHOLD && (!best || score > best.score)) {
+      best = { qa, score };
+    }
+  }
+  return best;
+}
+
+module.exports = {
+  cosineSimilarity,
+  findSimilarFeedbackQuestions,
+  buildContextBlock,
+  findPeerMatch,
+  DEFAULT_THRESHOLD,
+  PEER_THRESHOLD,
+};

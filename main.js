@@ -56,8 +56,16 @@ ipcMain.handle('persona:switch', (event, personaId) => {
   return { ok: true };
 });
 
-ipcMain.handle('thread:get', (event, personaId) => {
-  const messages = [...store.getMessages(personaId)].sort(
+ipcMain.handle('contacts:get', (event, personaId) => {
+  return store.getContactsForPersona(personaId).map((c) => {
+    const messages = store.getThreadMessages(personaId, c.id);
+    const last = messages[messages.length - 1];
+    return { ...c, lastMessage: last ? last.text : null, lastMessageAt: last ? last.createdAt : null };
+  });
+});
+
+ipcMain.handle('thread:get', (event, { personaId, contactId }) => {
+  const messages = [...store.getThreadMessages(personaId, contactId)].sort(
     (a, b) => new Date(a.createdAt) - new Date(b.createdAt)
   );
   const feedbackByQaId = {};
@@ -69,9 +77,9 @@ ipcMain.handle('thread:get', (event, personaId) => {
   return { messages, feedbackByQaId };
 });
 
-ipcMain.handle('chat:send', async (event, { personaId, text }) => {
+ipcMain.handle('chat:send', async (event, { personaId, contactId, text }) => {
   try {
-    return await chatFlow.sendMessage(personaId, text);
+    return await chatFlow.sendMessage(personaId, contactId, text);
   } catch (err) {
     console.error(err);
     return { ok: false, error: err.message };

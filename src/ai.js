@@ -120,10 +120,43 @@ Decide:
   }
 }
 
+const YES_NO_SCHEMA = {
+  type: 'object',
+  properties: {
+    accepted: { type: 'boolean' },
+  },
+  required: ['accepted'],
+  additionalProperties: false,
+};
+
+// Interprets a free-text reply to a yes/no offer (e.g. "want me to connect you?").
+async function interpretYesNo(replyText) {
+  const ai = getClient();
+  const prompt = `A user was asked a yes/no question. Their reply: "${replyText}"
+
+Does this reply indicate they said yes / agreed / accepted? Answer true only for a clear affirmative (e.g. "yeah", "sure", "connect me", "ok"). Answer false for a clear negative, or for anything ambiguous/unrelated.`;
+
+  try {
+    const response = await ai.messages.create({
+      model: CHAT_MODEL,
+      max_tokens: 256,
+      messages: [{ role: 'user', content: prompt }],
+      output_config: {
+        format: { type: 'json_schema', schema: YES_NO_SCHEMA },
+      },
+    });
+    const textBlock = response.content.find((b) => b.type === 'text');
+    return JSON.parse(textBlock.text).accepted;
+  } catch (err) {
+    throw friendlyError(err);
+  }
+}
+
 module.exports = {
   generateReply,
   embedText,
   analyzeFeedback,
+  interpretYesNo,
   hasApiKey,
   CHAT_MODEL,
   VOYAGE_MODEL,
