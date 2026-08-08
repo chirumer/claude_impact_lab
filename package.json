@@ -1,0 +1,17 @@
+{
+  "name": "restoline-messages",
+  "version": "1.0.0",
+  "description": "A phone-style Messages app with a RestoLine AI assistant contact powered by the Claude API.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "electron": "^43.3.0"
+  }
+}
